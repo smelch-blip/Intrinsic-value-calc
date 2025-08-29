@@ -1,0 +1,120 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+st.set_page_config(page_title="Stock Valuation Tool", layout="wide")
+st.title("📊 Stock Intrinsic Value Calculator")
+st.markdown("Use DCF, PE, and DDM to assess a stock's intrinsic value.")
+
+# Sidebar
+st.sidebar.header("🔧 Input Options")
+input_method = st.sidebar.radio("Choose input mode:", ["Auto-fetch (Yahoo Finance)", "Manual Input"])
+
+def calculate_dcf(fcf, growth, discount, terminal_growth, years=5):
+    projected_fcf = [(fcf * (1 + growth) ** i) / (1 + discount) ** i for i in range(1, years+1)]
+    terminal_value = (projected_fcf[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
+    terminal_value /= (1 + discount) ** years
+    return sum(projected_fcf) + terminal_value
+
+if input_method == "Auto-fetch (Yahoo Finance)":
+    ticker = st.text_input("Enter Stock Ticker (e.g., AAPL, INFY):", "AAPL")
+
+    if st.button("Fetch & Calculate"):
+        if not ticker.strip():
+            st.warning("Please enter a valid ticker.")
+        else:
+            try:
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                cashflow = stock.cashflow
+
+                if cashflow.empty:
+                    st.error("Cash flow data not available.")
+                else:
+                    st.subheader(f"{info.get('longName', ticker)} ({ticker})")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Price", f"${info.get('currentPrice', 'N/A')}")
+                    col2.metric("Market Cap", f"${info.get('marketCap', 0):,}")
+                    col3.metric("P/E Ratio", info.get("trailingPE", "N/A"))
+
+                    # Parameters
+                    st.subheader("⚙️ Valuation Parameters")
+                    g_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
+                    d_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
+                    t_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
+
+                    # Free Cash Flow
+                    fcf = None
+                    if 'Free Cash Flow' in cashflow.index:
+                        fcf_data = cashflow.loc['Free Cash Flow'].dropna()
+                        if not fcf_data.empty:
+                            fcf = fcf_data.iloc[0]
+
+                    if fcf:
+                        intrinsic_dcf = calculate_dcf(fcf, g_rate, d_rate, t_growth)
+                        shares = info.get('sharesOutstanding', 1)
+                        dcf_value = intrinsic_dcf / shares
+                        st.success(f"DCF Value: ${dcf_value:.2f}")
+                    else:
+                        st.warning("FCF data unavailable.")
+
+                    # PE-based Valuation
+                    pe = info.get("trailingPE")
+                    eps = info.get("trailingEps")
+                    if pe and eps:
+                        forward_eps = eps * (1 + g_rate)
+                        pe_val = forward_eps * pe
+                        st.info(f"PE-based Value: ${pe_val:.2f}")
+
+                    # DDM
+                    div_yield = info.get("dividendYield")
+                    if div_yield:
+                        div_per_share = info.get("currentPrice", 0) * div_yield
+                        ddm_val = div_per_share * (1 + t_growth) / (d_rate - t_growth)
+                        st.info(f"DDM Value: ${ddm_val:.2f}")
+                    else:
+                        st.warning("DDM not applicable – no dividend yield found.")
+
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+
+else:
+    # Manual Input Mode
+    st.header("✏️ Manual Data Input")
+    name = st.text_input("Company Name", "Example Corp")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        price = st.number_input("Current Price", value=100.0)
+        eps = st.number_input("EPS", value=5.0)
+        fcf = st.number_input("FCF (in millions)", value=100.0) * 1e6
+        shares = st.number_input("Shares Outstanding (in millions)", value=100.0) * 1e6
+        div = st.number_input("Dividend per Share", value=2.0)
+
+    with col2:
+        pe_ratio = st.number_input("PE Ratio", value=20.0)
+        g_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
+        d_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
+        t_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
+
+    if st.button("Calculate"):
+        dcf_val = calculate_dcf(fcf, g_rate, d_rate, t_growth) / shares
+        pe_val = eps * (1 + g_rate) * pe_ratio
+        ddm_val = div * (1 + t_growth) / (d_rate - t_growth) if div > 0 else None
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("DCF Value", f"${dcf_val:.2f}")
+        col2.metric("PE-based", f"${pe_val:.2f}")
+        col3.metric("DDM Value", f"${ddm_val:.2f}" if ddm_val else "N/A")
+
+# Sidebar Info
+st.sidebar.markdown("""
+**Valuation Methods:**
+
+- DCF: Future cash flow projection
+- PE: Forward EPS & market multiple
+- DDM: Dividend growth valuation
+""")
+
+st.sidebar.warning("This tool is for educational use only.")
