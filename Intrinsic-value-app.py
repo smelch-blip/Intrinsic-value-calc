@@ -3,176 +3,171 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# Set page configuration
+st.set_page_config(page_title="📊 Stock Intrinsic Value App", layout="wide")
 st.title("📊 Stock Intrinsic Value Calculator")
-st.markdown("Calculate DCF, DDM, and PE-based intrinsic values for any stock")
+st.markdown("Use DCF, PE, and DDM to assess a stock's true worth — now with sector-based valuation weights and recommendations.")
 
-# Sidebar for input method selection
-st.sidebar.header("Data Input Method")
-input_method = st.sidebar.radio(
-    "Choose data source:",
-    ["Auto-fetch (Yahoo Finance)", "Manual Input"]
-)
+# Define sector-specific default weights
+default_weights = {
+    "Tech": {"DCF": 0.6, "PE": 0.3, "DDM": 0.1},
+    "FMCG": {"DCF": 0.4, "PE": 0.5, "DDM": 0.1},
+    "Utilities": {"DCF": 0.2, "PE": 0.4, "DDM": 0.4},
+    "Startups": {"DCF": 0.8, "PE": 0.1, "DDM": 0.1},
+    "Banking": {"DCF": 0.3, "PE": 0.5, "DDM": 0.2},
+    "Retail": {"DCF": 0.5, "PE": 0.4, "DDM": 0.1}
+}
 
+# Sidebar - input method and sector
+st.sidebar.header("🛠️ Options")
+input_method = st.sidebar.radio("Choose input method:", ["Auto-fetch (Yahoo Finance)", "Manual Input"])
+selected_sector = st.sidebar.selectbox("Select Sector", list(default_weights.keys()))
+
+st.sidebar.markdown("### ⚖️ Customize Weights")
+dcf_weight = st.sidebar.slider("DCF Weight", 0.0, 1.0, default_weights[selected_sector]["DCF"])
+pe_weight = st.sidebar.slider("PE Weight", 0.0, 1.0, default_weights[selected_sector]["PE"])
+ddm_weight = st.sidebar.slider("DDM Weight", 0.0, 1.0, default_weights[selected_sector]["DDM"])
+
+# Normalize weights
+total_weight = dcf_weight + pe_weight + ddm_weight
+if total_weight == 0:
+    dcf_weight, pe_weight, ddm_weight = 1, 0, 0
+else:
+    dcf_weight /= total_weight
+    pe_weight /= total_weight
+    ddm_weight /= total_weight
+
+# Function to calculate DCF
+def calculate_dcf(fcf, growth, discount, terminal_growth, years=5):
+    projected_fcf = [(fcf * (1 + growth) ** i) / (1 + discount) ** i for i in range(1, years + 1)]
+    terminal_value = (projected_fcf[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
+    terminal_value /= (1 + discount) ** years
+    return sum(projected_fcf) + terminal_value
+
+# --------- MAIN LOGIC ---------
 if input_method == "Auto-fetch (Yahoo Finance)":
-    # Auto-fetch section
-    st.header("🔍 Stock Selection")
-    ticker = st.text_input("Enter Stock Ticker (e.g., AAPL, TSLA):", value="AAPL")
+    ticker = st.text_input("Enter Stock Ticker (e.g., AAPL, INFY):", "AAPL")
 
-    if st.button("Fetch Data & Calculate"):
+    if st.button("Fetch & Calculate"):
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-            cash_flow = stock.cashflow
-            financials = stock.financials
+            cashflow = stock.cashflow
 
-            # Display basic info
-            st.subheader(f"📈 {info.get('longName', ticker)} ({ticker})")
+            st.subheader(f"{info.get('longName', ticker)} ({ticker})")
             col1, col2, col3 = st.columns(3)
+            col1.metric("Price", f"${info.get('currentPrice', 'N/A')}")
+            col2.metric("Market Cap", f"${info.get('marketCap', 0):,}")
+            col3.metric("P/E Ratio", info.get("trailingPE", "N/A"))
 
-            with col1:
-                st.metric("Current Price", f"${info.get('currentPrice', 'N/A')}")
-            with col2:
-                st.metric("Market Cap", f"${info.get('marketCap', 'N/A'):,}")
-            with col3:
-                st.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
-
-            # Intrinsic Value Parameters
-            st.header("💰 Intrinsic Value Calculations")
-            st.subheader("DCF Parameters")
+            st.subheader("⚙️ Valuation Parameters")
             col1, col2, col3 = st.columns(3)
             with col1:
-                growth_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
+                g_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
             with col2:
-                discount_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
+                d_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
             with col3:
-                terminal_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
+                t_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
 
-            # DCF Calculation
-            try:
-                if 'Free Cash Flow' in cash_flow.index:
-                    fcf_data = cash_flow.loc['Free Cash Flow'].dropna()
-                    if len(fcf_data) > 0:
-                        latest_fcf = fcf_data.iloc[0]
-                        years = 5
-                        projected_fcf = []
-                        fcf = latest_fcf
+            # DCF
+            dcf_value = None
+            if "Free Cash Flow" in cashflow.index:
+                fcf_data = cashflow.loc["Free Cash Flow"].dropna()
+                if not fcf_data.empty:
+                    fcf = fcf_data.iloc[0]
+                    dcf_total = calculate_dcf(fcf, g_rate, d_rate, t_growth)
+                    shares = info.get("sharesOutstanding", 1)
+                    dcf_value = dcf_total / shares
 
-                        for i in range(years):
-                            fcf *= (1 + growth_rate)
-                            projected_fcf.append(fcf)
+            # PE
+            pe_value = None
+            if info.get("trailingPE") and info.get("trailingEps"):
+                forward_eps = info["trailingEps"] * (1 + g_rate)
+                pe_value = forward_eps * info["trailingPE"]
 
-                        terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-                        pv_fcf = [fcf / (1 + discount_rate) ** (i + 1) for i, fcf in enumerate(projected_fcf)]
-                        pv_terminal = terminal_value / (1 + discount_rate) ** years
-                        enterprise_value = sum(pv_fcf) + pv_terminal
+            # DDM
+            ddm_value = None
+            if info.get("dividendYield"):
+                div_per_share = info.get("currentPrice", 0) * info["dividendYield"]
+                ddm_value = div_per_share * (1 + t_growth) / (d_rate - t_growth)
 
-                        shares_outstanding = info.get('sharesOutstanding', info.get('impliedSharesOutstanding', 1))
-                        dcf_value = enterprise_value / shares_outstanding
+            # Compute Weighted Average
+            weighted_intrinsic = 0
+            value_count = 0
 
-                        st.subheader("📊 DCF Results")
-                        st.write(f"**DCF Intrinsic Value:** ${dcf_value:.2f}")
-                        st.write(f"**Current Price:** ${info.get('currentPrice', 0):.2f}")
-                        if dcf_value > info.get('currentPrice', 0):
-                            st.success("Stock appears UNDERVALUED based on DCF")
-                        else:
-                            st.error("Stock appears OVERVALUED based on DCF")
-            except Exception as e:
-                st.error(f"Error in DCF Calculation: {e}")
+            if dcf_value:
+                weighted_intrinsic += dcf_weight * dcf_value
+                value_count += 1
+            if pe_value:
+                weighted_intrinsic += pe_weight * pe_value
+                value_count += 1
+            if ddm_value:
+                weighted_intrinsic += ddm_weight * ddm_value
+                value_count += 1
 
-            # PE Multiple
-            current_pe = info.get('trailingPE')
-            eps = info.get('trailingEps')
-            if current_pe and eps:
-                forward_eps = eps * (1 + growth_rate)
-                pe_value = forward_eps * current_pe
+            if value_count > 0:
+                current_price = info.get("currentPrice", 0)
+                upside = ((weighted_intrinsic - current_price) / current_price) * 100
 
-                st.subheader("📊 PE Multiple Results")
-                st.write(f"**PE-based Value:** ${pe_value:.2f}")
-                st.write(f"**Current Price:** ${info.get('currentPrice', 0):.2f}")
-                if pe_value > info.get('currentPrice', 0):
-                    st.success("Stock appears UNDERVALUED based on PE")
+                st.header("📊 Final Summary")
+                st.write(f"**Weighted Intrinsic Value:** ${weighted_intrinsic:.2f}")
+                st.write(f"**Current Market Price:** ${current_price:.2f}")
+                st.write(f"**Upside/Downside:** {upside:.1f}%")
+
+                if upside >= 20:
+                    st.success("✅ Recommendation: BUY (Stock appears undervalued)")
                 else:
-                    st.error("Stock appears OVERVALUED based on PE")
-
-            # DDM Model
-            dividend_yield = info.get('dividendYield')
-            if dividend_yield and dividend_yield > 0:
-                dividend_per_share = info.get('currentPrice', 0) * dividend_yield
-                ddm_value = dividend_per_share * (1 + terminal_growth) / (discount_rate - terminal_growth)
-
-                st.subheader("📊 DDM Results")
-                st.write(f"**DDM Intrinsic Value:** ${ddm_value:.2f}")
-                st.write(f"**Current Price:** ${info.get('currentPrice', 0):.2f}")
-                if ddm_value > info.get('currentPrice', 0):
-                    st.success("Stock appears UNDERVALUED based on DDM")
-                else:
-                    st.error("Stock appears OVERVALUED based on DDM")
+                    st.warning("⚠️ Recommendation: HOLD or RESEARCH FURTHER")
             else:
-                st.info("DDM not applicable - stock doesn't pay dividends or data unavailable")
+                st.error("Not enough data available to calculate intrinsic value.")
 
         except Exception as e:
-            st.error(f"Error fetching data: {str(e)}")
+            st.error(f"Error fetching data: {e}")
 
 else:
-    # Manual Input Mode
-    st.header("✏️ Manual Data Input")
-    company_name = st.text_input("Company Name:", value="Example Corp")
-    col1, col2 = st.columns(2)
+    # Manual Input
+    st.subheader("✏️ Manual Data Input")
+    name = st.text_input("Company Name", "Example Corp")
+    current_price = st.number_input("Current Price", value=100.0)
+    fcf = st.number_input("Free Cash Flow (millions)", value=100.0) * 1e6
+    shares = st.number_input("Shares Outstanding (millions)", value=100.0) * 1e6
+    eps = st.number_input("EPS", value=5.0)
+    dividend = st.number_input("Dividend Per Share", value=2.0)
+    pe_ratio = st.number_input("PE Ratio", value=20.0)
 
-    with col1:
-        current_price = st.number_input("Current Stock Price ($):", value=100.0)
-        free_cash_flow = st.number_input("Latest Free Cash Flow (millions $):", value=1000.0)
-        shares_outstanding = st.number_input("Shares Outstanding (millions):", value=100.0)
-        eps = st.number_input("Earnings Per Share ($):", value=5.0)
-        dividend_per_share = st.number_input("Dividend Per Share ($):", value=2.0)
+    g_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
+    d_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
+    t_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
 
-    with col2:
-        growth_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
-        discount_rate = st.slider("Discount Rate/WACC (%)", 5.0, 20.0, 12.0) / 100
-        terminal_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
-        pe_ratio = st.number_input("Current P/E Ratio:", value=20.0)
+    if st.button("Calculate Intrinsic Value"):
+        dcf_val = calculate_dcf(fcf, g_rate, d_rate, t_growth) / shares
+        pe_val = eps * (1 + g_rate) * pe_ratio
+        ddm_val = dividend * (1 + t_growth) / (d_rate - t_growth) if dividend > 0 else None
 
-    if st.button("Calculate Intrinsic Values"):
-        years = 5
-        projected_fcf = []
-        fcf = free_cash_flow * 1e6
-        for i in range(years):
-            fcf *= (1 + growth_rate)
-            projected_fcf.append(fcf)
+        weighted_intrinsic = (
+            (dcf_val * dcf_weight if dcf_val else 0) +
+            (pe_val * pe_weight if pe_val else 0) +
+            (ddm_val * ddm_weight if ddm_val else 0)
+        )
 
-        terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
-        pv_fcf = [fcf / (1 + discount_rate) ** (i + 1) for i, fcf in enumerate(projected_fcf)]
-        pv_terminal = terminal_value / (1 + discount_rate) ** years
-        enterprise_value = sum(pv_fcf) + pv_terminal
-        dcf_value = enterprise_value / (shares_outstanding * 1e6)
+        upside = ((weighted_intrinsic - current_price) / current_price) * 100
 
-        forward_eps = eps * (1 + growth_rate)
-        pe_value = forward_eps * pe_ratio
+        st.subheader("📊 Results")
+        st.write(f"Weighted Intrinsic Value: ${weighted_intrinsic:.2f}")
+        st.write(f"Current Price: ${current_price:.2f}")
+        st.write(f"Upside/Downside: {upside:.1f}%")
 
-        if dividend_per_share > 0:
-            ddm_value = dividend_per_share * (1 + terminal_growth) / (discount_rate - terminal_growth)
+        if upside >= 20:
+            st.success("✅ Recommendation: BUY")
         else:
-            ddm_value = None
+            st.warning("⚠️ Recommendation: HOLD")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("DCF Value", f"${dcf_value:.2f}")
-        col2.metric("PE-based", f"${pe_value:.2f}")
-        col3.metric("DDM Value", f"${ddm_value:.2f}" if ddm_value else "N/A")
-
-# Sidebar
-st.sidebar.header("ℹ️ About")
-st.sidebar.info("""
-This calculator uses three valuation methods:
-
-**DCF (Discounted Cash Flow)**  
-Projects future free cash flows and discounts them to present value.
-
-**PE Multiple**  
-Uses earnings and a market multiple to arrive at fair value.
-
-**DDM (Dividend Discount Model)**  
-Applies to dividend-paying stocks using growth-adjusted dividends.
+# Sidebar info
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+### 📘 Methods
+- **DCF**: Discounted Cash Flow  
+- **PE**: Forward earnings with PE ratio  
+- **DDM**: Dividend growth-based model
 """)
-
-st.sidebar.header("⚠️ Disclaimer")
 st.sidebar.warning("This tool is for educational purposes only. Not financial advice.")
