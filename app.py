@@ -2,76 +2,70 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import traceback
 
 # =========================
-# VALUATION ENGINE CLASS
+# VALUATION ENGINE
 # =========================
 class SmartValuer:
     def __init__(self, ticker):
-        self.ticker = ticker
-        self.t = yf.Ticker(ticker)
+        self.ticker = ticker if ticker.endswith((".NS", ".BO")) else f"{ticker}.NS"
         try:
+            self.t = yf.Ticker(self.ticker)
+            # Use a fast fetch for basic info
             self.info = self.t.info
+            self.ltp = self.info.get('currentPrice') or self.info.get('previousClose')
+            self.shares = self.info.get('sharesOutstanding')
+            
+            # These can be slow/empty for some NSE stocks
             self.income = self.t.income_stmt
             self.balance = self.t.balance_sheet
             self.cashflow = self.t.cashflow
-        except:
+        except Exception as e:
+            st.error(f"Data Fetch Error: {e}")
             self.info = {}
-        
-        self.ltp = self.info.get('currentPrice') or self.info.get('previousClose')
-        self.shares = self.info.get('sharesOutstanding')
-        self.confidence = 0
-        self.model_outputs = {}
+            self.ltp = None
 
     def classify_business(self):
         industry = str(self.info.get('industry', '')).lower()
         sector = str(self.info.get('sector', '')).lower()
         if "bank" in industry or "financial" in sector: return "FINANCIAL"
-        if any(x in sector for x in ["energy", "basic materials"]): return "CYCLICAL"
+        if any(x in sector for x in ["energy", "basic materials", "metal"]): return "CYCLICAL"
         if "technology" in sector or "software" in industry: return "ASSET_LIGHT"
         return "GENERAL"
 
-    def run_dcf(self):
-        """Discounted Cash Flow (Growth Model)"""
+    def run_models(self):
+        models = {}
+        # 1. DCF (Growth)
         try:
-            fcf = self.cashflow.loc['Free Cash Flow'].iloc[0]
-            wacc, growth = 0.12, 0.05
-            if fcf and self.shares:
-                val = (fcf * 15) / self.shares # Simplified 15x FCF Multiple
-                self.confidence += 35
-                return val
-        except: return None
+            if self.cashflow is not None and 'Free Cash Flow' in self.cashflow.index:
+                fcf = self.cashflow.loc['Free Cash Flow'].iloc[0]
+                if fcf and self.shares:
+                    models["DCF (Growth)"] = (fcf * 18) / self.shares
+            else: models["DCF (Growth)"] = None
+        except: models["DCF (Growth)"] = None
 
-    def run_epv(self):
-        """Earnings Power Value (Stability Model)"""
+        # 2. EPV (Earnings Power)
         try:
-            ebit = self.income.loc['EBIT'].iloc[0]
-            if ebit and self.shares:
-                val = (ebit * 0.75 / 0.12) / self.shares
-                self.confidence += 30
-                return val
-        except: return None
+            if self.income is not None and 'EBIT' in self.income.index:
+                ebit = self.income.loc['EBIT'].iloc[0]
+                if ebit and self.shares:
+                    models["EPV (Earnings Power)"] = (ebit * 0.75 / 0.12) / self.shares
+            else: models["EPV (Earnings Power)"] = None
+        except: models["EPV (Earnings Power)"] = None
 
-    def run_pb_intrinsic(self):
-        """Justified P/B (Financial Model)"""
+        # 3. P/B Intrinsic (Asset Based)
         try:
             roe = self.info.get('returnOnEquity')
             bv = self.info.get('bookValue')
             if roe and bv:
-                val = bv * (roe / 0.12)
-                self.confidence += 35
-                return val
-        except: return None
+                models["P/B Intrinsic"] = bv * (roe / 0.12)
+            else: models["P/B Intrinsic"] = None
+        except: models["P/B Intrinsic"] = None
 
-    def get_intelligent_valuation(self):
-        biz = self.classify_business()
-        self.model_outputs = {
-            "DCF (Growth)": self.run_dcf(),
-            "EPV (Earnings Power)": self.run_epv(),
-            "P/B Intrinsic": self.run_pb_intrinsic()
-        }
-        
-        # Sector Weighting Logic
+        return models
+
+    def get_blend(self, models, biz):
         weights = {
             "FINANCIAL": {"P/B Intrinsic": 0.8, "EPV (Earnings Power)": 0.2, "DCF (Growth)": 0.0},
             "ASSET_LIGHT": {"DCF (Growth)": 0.6, "EPV (Earnings Power)": 0.3, "P/B Intrinsic": 0.1},
@@ -80,67 +74,46 @@ class SmartValuer:
         }.get(biz)
 
         weighted_val, total_weight = 0, 0
-        for model, val in self.model_outputs.items():
-            if val:
-                weighted_val += val * weights[model]
-                total_weight += weights[model]
+        for m, val in models.items():
+            if val is not None:
+                weighted_val += val * weights[m]
+                total_weight += weights[m]
         
-        final_fair = weighted_val / total_weight if total_weight > 0 else None
-        return final_fair, biz
+        return weighted_val / total_weight if total_weight > 0 else None
 
 # =========================
-# STREAMLIT UI
+# UI LAYOUT
 # =========================
-st.set_page_config(page_title="Valuation Deep-Dive", layout="centered")
+def main():
+    st.set_page_config(page_title="Valuation Router", layout="wide")
+    st.title("🏛️ Intelligent Valuation Deep-Dive")
 
-st.title("🏛️ Intelligent Stock Valuation")
-symbol = st.text_input("Enter NSE Ticker (e.g., RELIANCE, HDFCBANK)", "RELIANCE").strip().upper()
+    symbol = st.text_input("Enter Ticker (e.g., RELIANCE, HDFCBANK, TCS)", "RELIANCE").strip().upper()
 
-if symbol:
-    ticker_sym = f"{symbol}.NS"
-    with st.spinner(f"Analyzing {ticker_sym}..."):
-        valuer = SmartValuer(ticker_sym)
-        
-        if not valuer.ltp:
-            st.error("Could not fetch data. Please check the ticker symbol.")
-        else:
-            fair_value, biz_type = valuer.get_intelligent_valuation()
-            
-            # --- TOP LEVEL METRICS ---
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Current Price", f"₹{valuer.ltp}")
-            if fair_value:
-                upside = (fair_value / valuer.ltp - 1) * 100
-                col2.metric("Intelligent Fair Value", f"₹{round(fair_value, 2)}", f"{round(upside, 1)}% Upside")
-            col3.metric("Confidence Score", f"{valuer.confidence}%")
-
-            st.divider()
-
-            # --- INDIVIDUAL MODEL BREAKDOWN ---
-            st.subheader("Model Level Breakdown")
-            st.caption(f"Business Classification: **{biz_type}**")
-            
-            m_col1, m_col2, m_col3 = st.columns(3)
-            cols = [m_col1, m_col2, m_col3]
-            
-            for i, (model_name, value) in enumerate(valuer.model_outputs.items()):
-                with cols[i]:
-                    st.write(f"**{model_name}**")
-                    if value:
-                        st.write(f"₹{round(value, 2)}")
-                        gap = (value / valuer.ltp - 1) * 100
-                        st.caption(f"{'+' if gap >0 else ''}{round(gap,1)}% vs LTP")
-                    else:
-                        st.write("Unavailable")
-                        st.caption("Missing financial data")
-
-            st.divider()
-            
-            # --- FINAL VERDICT ---
-            if fair_value:
-                if valuer.ltp < fair_value * 0.8:
-                    st.success(f"🌟 **UNDERVALUED**: {symbol} is trading at a significant discount to its intelligent fair value.")
-                elif valuer.ltp > fair_value * 1.2:
-                    st.error(f"⚠️ **OVERVALUED**: The market price is significantly higher than the estimated intrinsic value.")
+    if symbol:
+        try:
+            with st.spinner("Analyzing business type and data availability..."):
+                sv = SmartValuer(symbol)
+                
+                if not sv.ltp:
+                    st.warning("Data error: Yahoo Finance didn't return a price. This is common if you ping them too fast. Wait 5s and try again.")
                 else:
-                    st.warning(f"⚖️ **FAIRLY VALUED**: The stock is trading within a reasonable range of its fair value.")
+                    biz = sv.classify_business()
+                    models = sv.run_models()
+                    fair = sv.get_blend(models, biz)
+
+                    # Top Metrics
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Current Price", f"₹{sv.ltp}")
+                    if fair:
+                        upside = (fair/sv.ltp - 1) * 100
+                        c2.metric("Intelligent Fair Value", f"₹{round(fair, 2)}", f"{round(upside, 1)}% {'Upside' if upside > 0 else 'Downside'}")
+                    c3.metric("Classification", biz)
+
+                    st.divider()
+
+                    # Model Breakdown Table
+                    st.subheader("Model Level Breakdown")
+                    
+                    m_cols = st.columns(len(models))
+                    for i, (name, val
