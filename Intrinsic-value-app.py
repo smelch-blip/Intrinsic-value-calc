@@ -1,175 +1,146 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
-# ------------------------- CONFIGURATION -------------------------
-st.set_page_config(page_title="📊 Stock Intrinsic Value Calculator", layout="wide")
-
-st.title("📊 Stock Intrinsic Value Calculator")
-st.markdown("Use DCF, PE, and DDM to assess a stock's intrinsic value with sector-based weights.")
-
-# ------------------------- SIDEBAR -------------------------
-st.sidebar.header("🛠️ Input Options")
-
-input_method = st.sidebar.radio("Choose input mode:", ["Auto-fetch (Yahoo Finance)", "Manual Input"])
-sector = st.sidebar.selectbox("Select Sector", ["Tech", "Consumer", "Industrial", "Finance", "Other"])
-
-st.sidebar.markdown("⚖️ **Customize Weights**")
-dcf_weight = st.sidebar.slider("DCF Weight", 0.0, 1.0, 0.6)
-pe_weight = st.sidebar.slider("PE Weight", 0.0, 1.0, 0.3)
-ddm_weight = 1.0 - (dcf_weight + pe_weight)
-st.sidebar.markdown(f"**DDM Weight:** {ddm_weight:.2f}")
-
-st.sidebar.markdown("📘 **Methods**")
-st.sidebar.markdown("""
-- **DCF**: Future cash flow projection  
-- **PE**: Forward earnings & market multiple  
-- **DDM**: Dividend growth valuation  
-""")
-st.sidebar.warning("This tool is for educational use only.")
-
-# ------------------------- FUNCTIONS -------------------------
-def calculate_dcf(fcf, growth, discount, terminal_growth, years=5):
-    projected = [(fcf * (1 + growth) ** i) / (1 + discount) ** i for i in range(1, years + 1)]
-    terminal = (projected[-1] * (1 + terminal_growth)) / (discount - terminal_growth)
-    terminal /= (1 + discount) ** years
-    return sum(projected) + terminal
-
-def format_number(value, is_inr=False):
-    if value is None: return "N/A"
-    if is_inr:
-        return f"₹{value/1e7:,.2f} Cr"
-    return f"${value/1e6:,.2f} M"
-
-def get_currency_symbol(ticker):
-    return "₹" if ticker.endswith(".NS") or ticker.endswith(".BO") else "$"
-
-# ------------------------- MAIN -------------------------
-if input_method == "Auto-fetch (Yahoo Finance)":
-    st.subheader("🧠 Valuation Parameters")
-    growth_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
-    discount_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
-    terminal_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
-
-    stock_input = st.text_input("Enter Stock Name or Ticker (e.g., Tata Motors or TATAMOTORS.NS)", "TATAMOTORS.NS")
-
-    if st.button("Fetch & Calculate"):
+# =========================
+# VALUATION ENGINE CLASS
+# =========================
+class SmartValuer:
+    def __init__(self, ticker):
+        self.ticker = ticker
+        self.t = yf.Ticker(ticker)
         try:
-            stock = yf.Ticker(stock_input)
-            info = stock.info
+            self.info = self.t.info
+            self.income = self.t.income_stmt
+            self.balance = self.t.balance_sheet
+            self.cashflow = self.t.cashflow
+        except:
+            self.info = {}
+        
+        self.ltp = self.info.get('currentPrice') or self.info.get('previousClose')
+        self.shares = self.info.get('sharesOutstanding')
+        self.confidence = 0
+        self.model_outputs = {}
 
-            if not isinstance(info, dict) or 'currentPrice' not in info:
-                st.error("Could not fetch data. Please check the name or ticker.")
-            else:
-                is_inr = stock_input.endswith(".NS") or stock_input.endswith(".BO")
-                currency = get_currency_symbol(stock_input)
+    def classify_business(self):
+        industry = str(self.info.get('industry', '')).lower()
+        sector = str(self.info.get('sector', '')).lower()
+        if "bank" in industry or "financial" in sector: return "FINANCIAL"
+        if any(x in sector for x in ["energy", "basic materials"]): return "CYCLICAL"
+        if "technology" in sector or "software" in industry: return "ASSET_LIGHT"
+        return "GENERAL"
 
-                st.subheader(f"{info.get('longName', 'Unknown Company')} ({stock_input.upper()})")
+    def run_dcf(self):
+        """Discounted Cash Flow (Growth Model)"""
+        try:
+            fcf = self.cashflow.loc['Free Cash Flow'].iloc[0]
+            wacc, growth = 0.12, 0.05
+            if fcf and self.shares:
+                val = (fcf * 15) / self.shares # Simplified 15x FCF Multiple
+                self.confidence += 35
+                return val
+        except: return None
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Price", f"{currency}{info.get('currentPrice', 0):,.2f}")
-                col2.metric("Market Cap", format_number(info.get('marketCap', 0), is_inr))
-                col3.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
+    def run_epv(self):
+        """Earnings Power Value (Stability Model)"""
+        try:
+            ebit = self.income.loc['EBIT'].iloc[0]
+            if ebit and self.shares:
+                val = (ebit * 0.75 / 0.12) / self.shares
+                self.confidence += 30
+                return val
+        except: return None
 
-                fcf = None
-                if 'Free Cash Flow' in stock.cashflow.index:
-                    fcf_series = stock.cashflow.loc['Free Cash Flow'].dropna()
-                    if not fcf_series.empty:
-                        fcf = fcf_series.iloc[0]
+    def run_pb_intrinsic(self):
+        """Justified P/B (Financial Model)"""
+        try:
+            roe = self.info.get('returnOnEquity')
+            bv = self.info.get('bookValue')
+            if roe and bv:
+                val = bv * (roe / 0.12)
+                self.confidence += 35
+                return val
+        except: return None
 
-                eps = info.get('trailingEps')
-                pe = info.get('trailingPE')
-                price = info.get('currentPrice', 0)
-                shares = info.get('sharesOutstanding', 1)
+    def get_intelligent_valuation(self):
+        biz = self.classify_business()
+        self.model_outputs = {
+            "DCF (Growth)": self.run_dcf(),
+            "EPV (Earnings Power)": self.run_epv(),
+            "P/B Intrinsic": self.run_pb_intrinsic()
+        }
+        
+        # Sector Weighting Logic
+        weights = {
+            "FINANCIAL": {"P/B Intrinsic": 0.8, "EPV (Earnings Power)": 0.2, "DCF (Growth)": 0.0},
+            "ASSET_LIGHT": {"DCF (Growth)": 0.6, "EPV (Earnings Power)": 0.3, "P/B Intrinsic": 0.1},
+            "CYCLICAL": {"EPV (Earnings Power)": 0.7, "DCF (Growth)": 0.1, "P/B Intrinsic": 0.2},
+            "GENERAL": {"DCF (Growth)": 0.4, "EPV (Earnings Power)": 0.4, "P/B Intrinsic": 0.2}
+        }.get(biz)
 
-                div_yield = info.get('dividendYield')
-                div_per_share = price * div_yield if div_yield else 0
+        weighted_val, total_weight = 0, 0
+        for model, val in self.model_outputs.items():
+            if val:
+                weighted_val += val * weights[model]
+                total_weight += weights[model]
+        
+        final_fair = weighted_val / total_weight if total_weight > 0 else None
+        return final_fair, biz
 
-                # ------------------ Valuations ------------------
-                dcf_val = calculate_dcf(fcf, growth_rate, discount_rate, terminal_growth) / shares if fcf else None
-                pe_val = eps * (1 + growth_rate) * pe if pe and eps else None
-                ddm_val = div_per_share * (1 + terminal_growth) / (discount_rate - terminal_growth) if div_yield else None
+# =========================
+# STREAMLIT UI
+# =========================
+st.set_page_config(page_title="Valuation Deep-Dive", layout="centered")
 
-                # ------------------ Output ------------------
-                if dcf_val:
-                    st.success(f"**DCF Value:** {currency}{dcf_val:.2f}")
-                else:
-                    st.info("DCF not available")
+st.title("🏛️ Intelligent Stock Valuation")
+symbol = st.text_input("Enter NSE Ticker (e.g., RELIANCE, HDFCBANK)", "RELIANCE").strip().upper()
 
-                if pe_val:
-                    st.info(f"**PE-based Value:** {currency}{pe_val:.2f}")
-                else:
-                    st.info("PE data not available")
-
-                if ddm_val:
-                    st.info(f"**DDM Value:** {currency}{ddm_val:.2f}")
-                else:
-                    st.info("DDM not available")
-
-                # ------------------ Final Weighted ------------------
-                available = [(dcf_val, dcf_weight), (pe_val, pe_weight), (ddm_val, ddm_weight)]
-                weighted_values = [val * wt for val, wt in available if val is not None]
-                total_weight = sum(wt for val, wt in available if val is not None)
-
-                if weighted_values:
-                    final_value = sum(weighted_values) / total_weight
-                    movement = ((final_value / price) - 1) * 100 if price else 0
-
-                    st.subheader("📌 Valuation Summary")
-                    col1, col2 = st.columns(2)
-                    col1.metric("Weighted Intrinsic Value", f"{currency}{final_value:.2f}")
-                    col2.metric("Current Price", f"{currency}{price:.2f}")
-
-                    if movement > 5:
-                        st.success(f"Expected movement: {movement:.2f}% UP")
-                    elif movement < -5:
-                        st.error(f"Expected movement: {movement:.2f}% DOWN")
-                    else:
-                        st.info(f"Expected movement: {movement:.2f}% - Fairly Priced")
-
-        except Exception as e:
-            st.error(f"Something went wrong while fetching stock data: {e}")
-
-# ------------------------- MANUAL MODE -------------------------
-else:
-    st.subheader("✍️ Manual Data Input")
-
-    name = st.text_input("Company Name", "Sample Inc")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        price = st.number_input("Current Price", value=100.0)
-        eps = st.number_input("EPS", value=5.0)
-        fcf = st.number_input("Free Cash Flow (M)", value=100.0) * 1e6
-        shares = st.number_input("Shares Outstanding (M)", value=100.0) * 1e6
-        div = st.number_input("Dividend/share", value=2.0)
-
-    with col2:
-        pe = st.number_input("P/E Ratio", value=20.0)
-        growth_rate = st.slider("Growth Rate (%)", 0.0, 20.0, 8.0) / 100
-        discount_rate = st.slider("Discount Rate (%)", 5.0, 20.0, 12.0) / 100
-        terminal_growth = st.slider("Terminal Growth (%)", 0.0, 5.0, 3.0) / 100
-
-    if st.button("Calculate"):
-        dcf_val = calculate_dcf(fcf, growth_rate, discount_rate, terminal_growth) / shares
-        pe_val = eps * (1 + growth_rate) * pe
-        ddm_val = div * (1 + terminal_growth) / (discount_rate - terminal_growth)
-
-        final_value = (
-            dcf_val * dcf_weight +
-            pe_val * pe_weight +
-            ddm_val * ddm_weight
-        )
-        movement = ((final_value / price) - 1) * 100 if price else 0
-
-        st.subheader("📌 Valuation Summary")
-        col1, col2 = st.columns(2)
-        col1.metric("Weighted Intrinsic Value", f"${final_value:.2f}")
-        col2.metric("Current Price", f"${price:.2f}")
-
-        if movement > 5:
-            st.success(f"Expected movement: {movement:.2f}% UP")
-        elif movement < -5:
-            st.error(f"Expected movement: {movement:.2f}% DOWN")
+if symbol:
+    ticker_sym = f"{symbol}.NS"
+    with st.spinner(f"Analyzing {ticker_sym}..."):
+        valuer = SmartValuer(ticker_sym)
+        
+        if not valuer.ltp:
+            st.error("Could not fetch data. Please check the ticker symbol.")
         else:
-            st.info(f"Expected movement: {movement:.2f}% - Fairly Priced")
+            fair_value, biz_type = valuer.get_intelligent_valuation()
+            
+            # --- TOP LEVEL METRICS ---
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Current Price", f"₹{valuer.ltp}")
+            if fair_value:
+                upside = (fair_value / valuer.ltp - 1) * 100
+                col2.metric("Intelligent Fair Value", f"₹{round(fair_value, 2)}", f"{round(upside, 1)}% Upside")
+            col3.metric("Confidence Score", f"{valuer.confidence}%")
+
+            st.divider()
+
+            # --- INDIVIDUAL MODEL BREAKDOWN ---
+            st.subheader("Model Level Breakdown")
+            st.caption(f"Business Classification: **{biz_type}**")
+            
+            m_col1, m_col2, m_col3 = st.columns(3)
+            cols = [m_col1, m_col2, m_col3]
+            
+            for i, (model_name, value) in enumerate(valuer.model_outputs.items()):
+                with cols[i]:
+                    st.write(f"**{model_name}**")
+                    if value:
+                        st.write(f"₹{round(value, 2)}")
+                        gap = (value / valuer.ltp - 1) * 100
+                        st.caption(f"{'+' if gap >0 else ''}{round(gap,1)}% vs LTP")
+                    else:
+                        st.write("Unavailable")
+                        st.caption("Missing financial data")
+
+            st.divider()
+            
+            # --- FINAL VERDICT ---
+            if fair_value:
+                if valuer.ltp < fair_value * 0.8:
+                    st.success(f"🌟 **UNDERVALUED**: {symbol} is trading at a significant discount to its intelligent fair value.")
+                elif valuer.ltp > fair_value * 1.2:
+                    st.error(f"⚠️ **OVERVALUED**: The market price is significantly higher than the estimated intrinsic value.")
+                else:
+                    st.warning(f"⚖️ **FAIRLY VALUED**: The stock is trading within a reasonable range of its fair value.")
