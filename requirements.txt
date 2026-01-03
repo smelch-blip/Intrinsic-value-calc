@@ -1,7 +1,4 @@
-streamlit
-yfinance
+streamlit>=1.31.0
+yfinance>=0.2.40
 pandas
 numpy
-requests
-beautifulsoup4
-yahooquery
