@@ -3,40 +3,24 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import traceback
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ============================================================
 # SYSTEM CONFIG
 # ============================================================
-st.set_page_config(page_title="Intelligent Valuation Pro", layout="wide")
+st.set_page_config(page_title="Wealth Architect Pro", layout="wide")
 
-# Custom CSS for a professional look
+# Styling for a clean, professional dashboard
 st.markdown("""
 <style>
-    .reportview-container { background: #f0f2f6; }
-    .stMetric { background: white; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; }
-    .stAlert { border-radius: 10px; }
+    .stMetric { background: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; }
+    .stApp { background-color: #f8fafc; }
+    h1 { color: #1e293b; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# HELPER FUNCTIONS & SESSION FIX
+# HELPERS
 # ============================================================
-def get_session():
-    """Create a session with headers to avoid Yahoo Rate Limiting"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    })
-    # Add retries for stability
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('https://', adapter)
-    return session
-
 def _sf(x):
     try:
         if x is None or pd.isna(x): return None
@@ -44,46 +28,47 @@ def _sf(x):
     except: return None
 
 # ============================================================
-# DATA FETCHING (THE FIX)
+# DATA FETCHING (FIXED VERSION)
 # ============================================================
-@st.cache_data(ttl=600) # 10 minute cache
+@st.cache_data(ttl=600)
 def fetch_data(ticker_str):
-    session = get_session()
-    t = yf.Ticker(ticker_str, session=session)
+    """
+    Fetches data using the latest yfinance logic. 
+    Note: yfinance now handles browser impersonation automatically via curl_cffi.
+    """
+    t = yf.Ticker(ticker_str)
     
     try:
-        # Get basic info first (Fast)
-        fast = t.fast_info
-        ltp = fast.get('last_price')
+        # Fetching .info is the most comprehensive handshake
+        raw_info = t.info
         
-        # Fetch dataframes with fallback
-        income = t.income_stmt
-        balance = t.balance_sheet
-        cashflow = t.cashflow
-        info = t.info # This is where rate limits usually happen
-        
+        # Build a clean data bundle
         return {
-            "ltp": ltp,
-            "info": info,
-            "income": income,
-            "balance": balance,
-            "cashflow": cashflow,
-            "shares": fast.get('shares_outstanding')
+            "ltp": raw_info.get('currentPrice') or raw_info.get('previousClose'),
+            "info": raw_info,
+            "income": t.income_stmt,
+            "balance": t.balance_sheet,
+            "cashflow": t.cashflow,
+            "shares": raw_info.get('sharesOutstanding')
         }
     except Exception as e:
+        # Check for rate limit issues specifically
         if "Rate Limit" in str(e) or "429" in str(e):
-            st.error("🚀 Yahoo Finance Rate Limit hit. Streamlit's IP is temporarily blocked. Please wait 2-3 minutes or try a different ticker.")
+            st.error("⏳ Yahoo is rate-limiting the Streamlit server. Please wait 2 minutes.")
         raise e
 
 # ============================================================
-# CORE VALUATION MODELS
+# VALUATION ENGINE
 # ============================================================
 def run_valuation(data):
     # 1. Classification
-    industry = data['info'].get('industry', '').lower()
-    if "bank" in industry or "financial" in industry:
+    info = data['info']
+    industry = info.get('industry', '').lower()
+    sector = info.get('sector', '').lower()
+    
+    if "bank" in industry or "financial" in sector:
         biz = "FINANCIAL"
-    elif any(x in industry for x in ["oil", "steel", "mining", "energy"]):
+    elif any(x in sector for x in ["energy", "materials", "utilities"]):
         biz = "CYCLICAL"
     else:
         biz = "GENERAL"
@@ -92,38 +77,46 @@ def run_valuation(data):
     shares = _sf(data['shares'])
     ltp = _sf(data['ltp'])
     
-    # 3. Individual Models
+    # 3. Models
     models = {}
     
-    # DCF (Simplified)
+    # DCF (Growth based)
     try:
+        # Get latest Free Cash Flow
         fcf = data['cashflow'].loc['Free Cash Flow'].iloc[0]
-        models["DCF (Growth)"] = (fcf * 15) / shares
+        if fcf and shares:
+            # Simple 2-stage logic: 15x multiple exit
+            models["DCF (Growth)"] = (fcf * 15) / shares
     except: models["DCF (Growth)"] = None
     
-    # EPV
+    # EPV (Earnings Power Value)
     try:
         ebit = data['income'].loc['EBIT'].iloc[0]
-        models["EPV (Earnings Power)"] = (ebit * 0.75 / 0.12) / shares
+        if ebit and shares:
+            # Assuming 12% cost of capital and 25% tax
+            models["EPV (Earnings Power)"] = (ebit * 0.75 / 0.12) / shares
     except: models["EPV (Earnings Power)"] = None
 
-    # PB Intrinsic
+    # PB Intrinsic (Asset based)
     try:
-        roe = data['info'].get('returnOnEquity', 0.12)
-        bv = data['info'].get('bookValue')
-        models["P/B Intrinsic"] = bv * (roe / 0.12)
+        roe = info.get('returnOnEquity', 0.12)
+        bv = info.get('bookValue')
+        if bv:
+            # Justified P/B multiple
+            models["P/B Intrinsic"] = bv * (roe / 0.12)
     except: models["P/B Intrinsic"] = None
 
-    # 4. Intelligent Blend (Weighted)
+    # 4. Intelligent Weighted Blend
     weights = {
         "FINANCIAL": {"P/B Intrinsic": 0.8, "EPV (Earnings Power)": 0.2, "DCF (Growth)": 0.0},
+        "CYCLICAL": {"EPV (Earnings Power)": 0.6, "DCF (Growth)": 0.2, "P/B Intrinsic": 0.2},
         "GENERAL": {"DCF (Growth)": 0.4, "EPV (Earnings Power)": 0.4, "P/B Intrinsic": 0.2}
-    }.get(biz, {"DCF (Growth)": 0.33, "EPV (Earnings Power)": 0.33, "P/B Intrinsic": 0.33})
+    }.get(biz)
 
     weighted_val = 0
     total_w = 0
     for m, val in models.items():
-        if val:
+        if val is not None and m in weights:
             weighted_val += val * weights[m]
             total_w += weights[m]
     
@@ -132,37 +125,61 @@ def run_valuation(data):
     return biz, models, fair_value
 
 # ============================================================
-# MAIN UI
+# USER INTERFACE
 # ============================================================
-st.title("🏛️ Intelligent Valuation Deep-Dive")
-ticker_input = st.text_input("Enter NSE Ticker (e.g. RELIANCE, TCS)", "ITC").upper()
-ticker = f"{ticker_input}.NS"
+def main():
+    st.title("🏛️ Intelligent Valuation Deep-Dive")
+    st.caption("Professional-grade intrinsic valuation for NSE stocks.")
 
-if st.button("Analyze Stock"):
-    try:
-        with st.spinner(f"Requesting data for {ticker}..."):
-            data = fetch_data(ticker)
-            biz, model_results, fair_value = run_valuation(data)
-            
-            # --- Results Header ---
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Current Price", f"₹{round(data['ltp'], 2)}")
-            if fair_value:
-                upside = (fair_value/data['ltp'] - 1) * 100
-                c2.metric("Intelligent Fair Value", f"₹{round(fair_value, 2)}", f"{round(upside, 1)}% Upside")
-            c3.metric("Business Type", biz)
-            
-            st.divider()
-            
-            # --- Individual Model Results ---
-            st.subheader("Individual Model Outputs")
-            
-            m_cols = st.columns(3)
-            for i, (name, val) in enumerate(model_results.items()):
-                with m_cols[i]:
-                    st.write(f"**{name}**")
-                    st.write(f"₹{round(val, 2)}" if val else "Data Unavailable")
+    with st.sidebar:
+        st.header("Parameters")
+        mos = st.slider("Margin of Safety (%)", 0, 50, 20)
+        st.info("The Margin of Safety (MoS) protects you from errors in estimation.")
 
-    except Exception:
-        st.error("App encountered a data error.")
-        st.code(traceback.format_exc())
+    ticker_input = st.text_input("Enter NSE Ticker (e.g. RELIANCE, TCS, HDFCBANK)", "TCS").upper().strip()
+    
+    if ticker_input:
+        # Auto-append .NS for NSE stocks
+        ticker = ticker_input if ticker_input.endswith((".NS", ".BO")) else f"{ticker_input}.NS"
+        
+        if st.button("Run Valuation Analysis"):
+            try:
+                with st.spinner(f"Fetching financial statements for {ticker}..."):
+                    # Step 1: Fetch
+                    data = fetch_data(ticker)
+                    
+                    # Step 2: Calculate
+                    biz, results, fair_value = run_valuation(data)
+                    
+                    # Step 3: Display Metrics
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Current Price", f"₹{round(data['ltp'], 2)}")
+                    
+                    if fair_value:
+                        upside = (fair_value / data['ltp'] - 1) * 100
+                        c2.metric("Intelligent Fair Value", f"₹{round(fair_value, 2)}", f"{round(upside, 1)}% Upside")
+                        
+                        mos_price = fair_value * (1 - mos/100)
+                        c3.metric(f"MoS Buy Price ({mos}%)", f"₹{round(mos_price, 2)}")
+                    
+                    st.divider()
+                    
+                    # Step 4: Model Breakdown
+                    st.subheader("Model Outputs")
+                    m_cols = st.columns(3)
+                    for i, (name, val) in enumerate(results.items()):
+                        with m_cols[i]:
+                            if val:
+                                st.write(f"**{name}**")
+                                st.title(f"₹{round(val, 2)}")
+                            else:
+                                st.write(f"**{name}**")
+                                st.write("Data missing in Yahoo reports.")
+
+            except Exception:
+                st.error("A critical data error occurred. This is often due to Yahoo Finance rate limits.")
+                st.code(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
