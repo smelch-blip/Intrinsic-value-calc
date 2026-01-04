@@ -4,182 +4,154 @@ import pandas as pd
 import numpy as np
 import traceback
 
-# ============================================================
-# SYSTEM CONFIG
-# ============================================================
+# 1. PAGE SETUP
 st.set_page_config(page_title="Wealth Architect Pro", layout="wide")
 
-# Styling for a clean, professional dashboard
+# Styling
 st.markdown("""
 <style>
-    .stMetric { background: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; }
+    .stMetric { background: white; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; }
     .stApp { background-color: #f8fafc; }
-    h1 { color: #1e293b; }
+    .formula-box { background-color: #f1f5f9; padding: 10px; border-radius: 5px; font-family: monospace; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================
-# HELPERS
-# ============================================================
-def _sf(x):
-    try:
-        if x is None or pd.isna(x): return None
-        return float(x)
-    except: return None
-
-# ============================================================
-# DATA FETCHING (FIXED VERSION)
-# ============================================================
+# 2. DATA FETCHING (NATIVE YFINANCE - NO SESSION)
 @st.cache_data(ttl=600)
 def fetch_data(ticker_str):
-    """
-    Fetches data using the latest yfinance logic. 
-    Note: yfinance now handles browser impersonation automatically via curl_cffi.
-    """
+    # CRITICAL: No session=session here. Let yfinance handle it.
     t = yf.Ticker(ticker_str)
-    
     try:
-        # Fetching .info is the most comprehensive handshake
-        raw_info = t.info
-        
-        # Build a clean data bundle
+        info = t.info
         return {
-            "ltp": raw_info.get('currentPrice') or raw_info.get('previousClose'),
-            "info": raw_info,
+            "ltp": info.get('currentPrice') or info.get('previousClose'),
+            "info": info,
             "income": t.income_stmt,
-            "balance": t.balance_sheet,
             "cashflow": t.cashflow,
-            "shares": raw_info.get('sharesOutstanding')
+            "shares": info.get('sharesOutstanding')
         }
     except Exception as e:
-        # Check for rate limit issues specifically
-        if "Rate Limit" in str(e) or "429" in str(e):
-            st.error("⏳ Yahoo is rate-limiting the Streamlit server. Please wait 2 minutes.")
+        if "429" in str(e): st.error("🚀 Rate limit hit. Wait 1 min.")
         raise e
 
-# ============================================================
-# VALUATION ENGINE
-# ============================================================
+# 3. VALUATION CALCULATIONS & INPUT TRACKING
 def run_valuation(data):
-    # 1. Classification
     info = data['info']
-    industry = info.get('industry', '').lower()
-    sector = info.get('sector', '').lower()
+    income = data['income']
+    cashflow = data['cashflow']
+    shares = data['shares']
+    ltp = data['ltp']
     
-    if "bank" in industry or "financial" in sector:
-        biz = "FINANCIAL"
-    elif any(x in sector for x in ["energy", "materials", "utilities"]):
-        biz = "CYCLICAL"
-    else:
-        biz = "GENERAL"
-
-    # 2. Extract Values
-    shares = _sf(data['shares'])
-    ltp = _sf(data['ltp'])
-    
-    # 3. Models
-    models = {}
-    
-    # DCF (Growth based)
+    # --- MODEL 1: DCF (Growth) ---
     try:
-        # Get latest Free Cash Flow
-        fcf = data['cashflow'].loc['Free Cash Flow'].iloc[0]
-        if fcf and shares:
-            # Simple 2-stage logic: 15x multiple exit
-            models["DCF (Growth)"] = (fcf * 15) / shares
-    except: models["DCF (Growth)"] = None
-    
-    # EPV (Earnings Power Value)
-    try:
-        ebit = data['income'].loc['EBIT'].iloc[0]
-        if ebit and shares:
-            # Assuming 12% cost of capital and 25% tax
-            models["EPV (Earnings Power)"] = (ebit * 0.75 / 0.12) / shares
-    except: models["EPV (Earnings Power)"] = None
+        fcf = cashflow.loc['Free Cash Flow'].iloc[0]
+        dcf_val = (fcf * 15) / shares
+        dcf_params = {
+            "Parameter": ["Latest Free Cash Flow", "Exit Multiple", "Shares Outstanding"],
+            "Value": [f"₹{fcf:,.0f}", "15x", f"{shares:,.0f}"],
+            "Source": ["Cashflow Statement", "Assumed Standard", "Company Info"]
+        }
+    except: dcf_val, dcf_params = None, None
 
-    # PB Intrinsic (Asset based)
+    # --- MODEL 2: EPV (Earnings Power) ---
+    try:
+        ebit = income.loc['EBIT'].iloc[0]
+        tax_rate = 0.25
+        wacc = 0.12
+        epv_val = (ebit * (1 - tax_rate) / wacc) / shares
+        epv_params = {
+            "Parameter": ["EBIT", "Tax Rate", "WACC (Discount)", "Shares Outstanding"],
+            "Value": [f"₹{ebit:,.0f}", f"{tax_rate*100}%", f"{wacc*100}%", f"{shares:,.0f}"],
+            "Source": ["Income Statement", "Standard Corporate", "Equity Risk Premium", "Company Info"]
+        }
+    except: epv_val, epv_params = None, None
+
+    # --- MODEL 3: P/B Intrinsic ---
     try:
         roe = info.get('returnOnEquity', 0.12)
-        bv = info.get('bookValue')
-        if bv:
-            # Justified P/B multiple
-            models["P/B Intrinsic"] = bv * (roe / 0.12)
-    except: models["P/B Intrinsic"] = None
+        bv = info.get('bookValue', 0)
+        ke = 0.12 # Cost of Equity
+        pb_val = bv * (roe / ke)
+        pb_params = {
+            "Parameter": ["Return on Equity (ROE)", "Book Value Per Share", "Cost of Equity (Ke)"],
+            "Value": [f"{roe*100:.2f}%", f"₹{bv:.2f}", f"{ke*100}%"],
+            "Source": ["Company Info", "Balance Sheet", "Risk-Free Rate + Beta"]
+        }
+    except: pb_val, pb_params = None, None
 
-    # 4. Intelligent Weighted Blend
-    weights = {
-        "FINANCIAL": {"P/B Intrinsic": 0.8, "EPV (Earnings Power)": 0.2, "DCF (Growth)": 0.0},
-        "CYCLICAL": {"EPV (Earnings Power)": 0.6, "DCF (Growth)": 0.2, "P/B Intrinsic": 0.2},
-        "GENERAL": {"DCF (Growth)": 0.4, "EPV (Earnings Power)": 0.4, "P/B Intrinsic": 0.2}
-    }.get(biz)
-
-    weighted_val = 0
-    total_w = 0
-    for m, val in models.items():
-        if val is not None and m in weights:
-            weighted_val += val * weights[m]
-            total_w += weights[m]
+    # --- INTELLIGENT FAIR VALUE ---
+    vals = [v for v in [dcf_val, epv_val, pb_val] if v is not None]
+    fair_value = sum(vals) / len(vals) if vals else ltp
     
-    fair_value = weighted_val / total_w if total_w > 0 else None
-    
-    return biz, models, fair_value
+    return {
+        "DCF": {"value": dcf_val, "params": dcf_params, "formula": "FV = (FCF * 15) / Shares"},
+        "EPV": {"value": epv_val, "params": epv_params, "formula": "FV = [EBIT * (1 - Tax) / WACC] / Shares"},
+        "P/B": {"value": pb_val, "params": pb_params, "formula": "FV = Book Value * (ROE / Ke)"},
+        "IFV": fair_value
+    }
 
-# ============================================================
-# USER INTERFACE
-# ============================================================
+# 4. MAIN UI
 def main():
     st.title("🏛️ Intelligent Valuation Deep-Dive")
-    st.caption("Professional-grade intrinsic valuation for NSE stocks.")
+    ticker_input = st.text_input("Enter NSE Ticker", "TCS").upper().strip()
+    ticker = f"{ticker_input}.NS" if not ticker_input.endswith((".NS", ".BO")) else ticker_input
 
     with st.sidebar:
-        st.header("Parameters")
-        mos = st.slider("Margin of Safety (%)", 0, 50, 20)
-        st.info("The Margin of Safety (MoS) protects you from errors in estimation.")
+        mos = st.slider("Margin of Safety (%)", 5, 50, 20)
+        st.write("---")
+        st.info("Calculations use Yahoo Finance TTM data.")
 
-    ticker_input = st.text_input("Enter NSE Ticker (e.g. RELIANCE, TCS, HDFCBANK)", "TCS").upper().strip()
-    
-    if ticker_input:
-        # Auto-append .NS for NSE stocks
-        ticker = ticker_input if ticker_input.endswith((".NS", ".BO")) else f"{ticker_input}.NS"
-        
-        if st.button("Run Valuation Analysis"):
-            try:
-                with st.spinner(f"Fetching financial statements for {ticker}..."):
-                    # Step 1: Fetch
-                    data = fetch_data(ticker)
-                    
-                    # Step 2: Calculate
-                    biz, results, fair_value = run_valuation(data)
-                    
-                    # Step 3: Display Metrics
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Current Price", f"₹{round(data['ltp'], 2)}")
-                    
-                    if fair_value:
-                        upside = (fair_value / data['ltp'] - 1) * 100
-                        c2.metric("Intelligent Fair Value", f"₹{round(fair_value, 2)}", f"{round(upside, 1)}% Upside")
+    if st.button("Analyze Stock"):
+        try:
+            with st.spinner(f"Retrieving data for {ticker}..."):
+                data = fetch_data(ticker)
+                results = run_valuation(data)
+                
+                # --- TOP METRICS ---
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Current Price", f"₹{data['ltp']:.2f}")
+                
+                if results['IFV']:
+                    upside = (results['IFV']/data['ltp'] - 1) * 100
+                    c2.metric("Intelligent Fair Value", f"₹{results['IFV']:.2f}", f"{upside:.1f}% Upside")
+                    with c2: 
+                        with st.popover("ℹ️ IFV Logic"):
+                            st.write("**Intelligent Fair Value Calculation:**")
+                            st.latex(r"IFV = \frac{DCF + EPV + PB}{n}")
+                            st.caption("Averaging multiple models reduces individual model bias.")
+
+                    mos_price = results['IFV'] * (1 - mos/100)
+                    c3.metric(f"MoS Buy Price ({mos}%)", f"₹{mos_price:.2f}")
+
+                st.divider()
+
+                # --- MODEL BREAKDOWN ---
+                st.subheader("📊 Model Breakdown & Input Trace")
+                
+                tabs = st.tabs(["DCF (Growth)", "EPV (Earnings)", "P/B Intrinsic"])
+                
+                model_keys = ["DCF", "EPV", "P/B"]
+                for i, tab in enumerate(tabs):
+                    key = model_keys[i]
+                    with tab:
+                        col_a, col_b = st.columns([1, 2])
+                        with col_a:
+                            st.metric(f"{key} Value", f"₹{results[key]['value']:.2f}" if results[key]['value'] else "N/A")
+                            with st.popover("ℹ️ View Formula"):
+                                st.write(f"**{key} Formula:**")
+                                st.code(results[key]['formula'])
                         
-                        mos_price = fair_value * (1 - mos/100)
-                        c3.metric(f"MoS Buy Price ({mos}%)", f"₹{round(mos_price, 2)}")
-                    
-                    st.divider()
-                    
-                    # Step 4: Model Breakdown
-                    st.subheader("Model Outputs")
-                    m_cols = st.columns(3)
-                    for i, (name, val) in enumerate(results.items()):
-                        with m_cols[i]:
-                            if val:
-                                st.write(f"**{name}**")
-                                st.title(f"₹{round(val, 2)}")
+                        with col_b:
+                            if results[key]['params']:
+                                st.write("**Input Parameters Used:**")
+                                st.table(pd.DataFrame(results[key]['params']))
                             else:
-                                st.write(f"**{name}**")
-                                st.write("Data missing in Yahoo reports.")
+                                st.warning("Insufficient data from Yahoo to populate parameters.")
 
-            except Exception:
-                st.error("A critical data error occurred. This is often due to Yahoo Finance rate limits.")
-                st.code(traceback.format_exc())
+        except Exception:
+            st.error("Error detected. Reboot app if code was recently updated.")
+            st.code(traceback.format_exc())
 
 if __name__ == "__main__":
     main()
